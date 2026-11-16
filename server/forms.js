@@ -130,7 +130,7 @@ const T = {
 // ---------- mẫu HĐ / QĐ / đơn nghỉ việc theo Sổ QLLĐ: HCNS sửa được (hr_template), {{tên}} = chỗ tự điền ----------
 const TPL = { ...require('./tpl-defaults'), ...require('./tpl-don') };   // tpl-don: app tự dựng (có chữ MẪU)
 const DON = new Set(Object.keys(require('./tpl-don')));
-const ENT_TPL = { leave: 'DON_PHEP', trip: 'DON_CONG_TAC', ot: 'DON_TANG_CA', att_add: 'PHIEU_CHAM_BS', room_book: 'PHONG_HOP', car_book: 'MUON_XE', resign: 'DON_NGHI', rec_memo: 'TO_TRINH' };
+const ENT_TPL = { leave: 'DON_PHEP', trip: 'DON_CONG_TAC', ot: 'DON_TANG_CA', att_add: 'PHIEU_CHAM_BS', room_book: 'PHONG_HOP', car_book: 'MUON_XE', resign: 'DON_NGHI', rec_memo: 'TO_TRINH', candidate: 'THU_MOI_NV' };
 const entOfTpl = k => Object.values(CT_TPL).includes(k) || k === 'HDLD_QL' ? 'contract' : Object.values(DEC_TPL).includes(k) ? 'decision' : Object.keys(ENT_TPL).find(e => ENT_TPL[e] === k);
 for (const [k, v] of Object.entries(TPL)) { v.ent = null; v.src = DON.has(k) ? 'tu_tao' : 'soqld'; }
 const CT_TPL = { HD01: 'HDTV', HD02: 'HDLD_XDTH', HD03: 'HDLD_KXD', HD04: 'PLHD' }, DEC_TPL = { HD08: 'QD_LUONG', HD10: 'QD_CD', HD11: 'QD_CD_TV' };

@@ -329,10 +329,11 @@ async function scopeCheck(db, e, rec, user) {
   if (!ok) deny('Bản ghi thuộc phạm vi của nhân viên khác');
 }
 async function get(entKey, id, user, { db = { q, one }, reveal } = {}) {
-  const e = ent(entKey); if (!can(user, e, 'r')) deny();
+  const e = ent(entKey), H_sees = H[entKey]?.sees; if (!can(user, e, 'r') && !H_sees) deny();
   if (!/^\d+$/.test(String(id))) notFound(null);   // đường dẫn sai (vd. /api/e/x/abc) → 404 thay vì lỗi máy chủ
   const row = notFound(await db.one(`SELECT t.*, ${labelCols(e).join(', ')} FROM ${e.table} t WHERE t.id = $1`, [+id]));
-  await scopeCheck(db, e, row, user);
+  // sees: người được chỉ định trên bản ghi (vd. giám đốc / kế toán pháp nhân) xem được dù vai trò không có quyền xem mục này
+  if (!(H_sees && await H_sees(row, user, db))) { if (!can(user, e, 'r')) deny(); await scopeCheck(db, e, row, user); }
   if (H[entKey]?.decorate) await H[entKey].decorate([row], { db, user, one: true });
   maskPii(e, row, user, reveal);
   if (e.flow) await handlers(db, e, [row]);   // «Người đang xử lý» cũng hiện trong chi tiết phiếu
@@ -357,7 +358,7 @@ async function perms(e, row, user, approvals, db) {
     files: can(user, e, 'u') || can(user, e, 'c') || (e.acts || []).some(a => actOk(user, e, a)),
     export: can(user, e, 'x'),
   };
-  if (H[e.key]?.perms) Object.assign(out, await H[e.key].perms(row, user, db));
+  if (H[e.key]?.perms) { const x = await H[e.key].perms(row, user, db) || {}; if (x.extraActs) { out.acts = [...new Set([...out.acts, ...x.extraActs])]; delete x.extraActs; } Object.assign(out, x); }
   return out;
 }
 function canApprove(e, row, user, open) {
@@ -524,7 +525,7 @@ async function submit(entKey, id, user, { comment, db: outer, demo } = {}) {
     if (H[entKey]?.onSubmit) await H[entKey].onSubmit(rec, ctx);
     await sys(db, entKey, rec.id, { [fl.field]: 'cho_duyet' }, user, 'trinh_duyet', comment);
     const title = `${fl.submitLabel || 'Trình duyệt'} ${e.one} ${await labelOf(db, entKey, rec.id)}`;
-    const ap = rec.approver_id || (e.toHead ? await headOf(db, rec, user.id) : null);
+    const ap = rec.approver_id || (H[entKey]?.approver ? await H[entKey].approver(rec, db, user) : null) || (e.toHead ? await headOf(db, rec, user.id) : null);   // approver: người duyệt chỉ định theo bản ghi (vd. giám đốc pháp nhân)
     const a = await db.one('INSERT INTO hr_approval (ent, rec_id, title, roles, approver_id, requested_by, comment, is_demo) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
       [entKey, rec.id, title, e.a || ['tp_hcns'], ap, user.id, comment || null, !!(demo ?? rec.is_demo)]);
     await notify(db, (await approversOf(db, e, rec, a)).map(u => u.id).filter(id => id !== user.id), `Cần duyệt: ${title.replace(/^Trình duyệt /, '')}`, comment, `e/${entKey}/${rec.id}`);
@@ -540,7 +541,7 @@ async function approve(entKey, id, user, { ok, comment, db: outer } = {}) {
     if (!open || rec[fl.field] !== 'cho_duyet') bad('Không có đề nghị nào đang chờ duyệt');
     if (open.requested_by === user.id && user.role !== 'admin' && !SELF_OK) deny('Không tự phê duyệt đề nghị do mình trình (tách nhiệm)');
     if (!canApprove(e, rec, user, open)) deny('Bạn không phải cấp phê duyệt của đề nghị này');
-    await scopeCheck(db, e, rec, user);
+    if (open.approver_id !== user.id) await scopeCheck(db, e, rec, user);   // người duyệt được chỉ định đích danh: không xét phạm vi vai trò
     if (!ok && !comment) bad('Từ chối cần ghi rõ lý do');
     const ctx = ctxOf(db, user, { demo: rec.is_demo });
     let to = ok ? fl.approve.ok : (fl.approve.no || 'tu_choi');
@@ -563,8 +564,9 @@ async function act(entKey, id, name, user, input = {}, { db: outer, demo } = {})
   const fn = H[entKey]?.acts?.[name] || bad('Thao tác chưa được cài đặt');
   const run = async db => {
     const rec = notFound(await raw(db, entKey, +id, true));
-    if (!actOk(user, e, a)) deny(offDuty(user, e) ? `Mảng «${a.l}» không được giao cho bạn` : `Vai trò của bạn không được «${a.l}»`);
-    await scopeCheck(db, e, rec, user);
+    const named = !!(H[entKey]?.canAct && await H[entKey].canAct(name, rec, user, db));   // người được chỉ định trên bản ghi (vd. kế toán pháp nhân «Xác nhận đã nộp»)
+    if (!named && !actOk(user, e, a)) deny(offDuty(user, e) ? `Mảng «${a.l}» không được giao cho bạn` : `Vai trò của bạn không được «${a.l}»`);
+    if (!named) await scopeCheck(db, e, rec, user);
     if (a.from !== '*' && !a.from.includes(rec.status)) bad(`Không thực hiện «${a.l}» khi đang «${await optLabel(F[entKey].status, rec.status)}»`);
     const data = {};
     for (const f of a.ask || []) {

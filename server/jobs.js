@@ -104,6 +104,14 @@ async function auto() {
         await C.notify(dbx, await usersOf([e.id]), `${left < 0 ? 'Quá hạn' : left === 0 ? 'Hôm nay đến hạn' : `Còn ${left} ngày`}: ${k.task || 'đầu việc'}`, `Sự kiện ${ev.name} · hạn ${k.due}`, null); c++; }
     return `${c} nhắc`;
   }));
+  // tuyển dụng tự động (recauto.js): ngày 25 đề xuất kế hoạch tháng sau; mỗi giờ: CV đạt → đề xuất lịch PV, tới hạn → tạo hồ sơ + HĐ thử việc + tài khoản; 8h: nhắc đăng tin, checklist tiếp nhận
+  const RA = require('./recauto');
+  if (+t.slice(8) >= 25 && (+t.slice(8) > 25 || h >= 8)) await step('đề xuất kế hoạch tuyển', () => once('td_de_xuat', RA.nextMonth(m), async () => `Đề xuất ${await tx(db => RA.recDraft(db, RA.nextMonth(m)))} vị trí`));
+  await step('đề xuất lịch phỏng vấn', () => RA.proposeInterviews());
+  await step('tự tạo hồ sơ nhận việc', () => RA.autoHire());
+  if (h >= 8) { await step('nhắc đăng tin', () => once('td_nhac_dang', t, async () => `${await RA.remindPosts()} kế hoạch`)); await step('nhắc checklist tiếp nhận', () => once('td_checklist', t, async () => `${await RA.remindChecklist()} ứng viên`)); }
+  // ngày 20 (từ 8h): bảng trích nộp BH, CĐ tháng này tính lại theo dữ liệu mới nhất → báo NV HCNS phụ trách pháp nhân kiểm tra, trình giám đốc pháp nhân
+  if (+t.slice(8) >= 20 && (+t.slice(8) > 20 || h >= 8)) await step('BH CĐ ngày 20', () => once('bh_cd_kiem_tra', m, async () => `Báo kiểm tra ${await tx(db => B.sheetReview(db, m))} bảng`));
   if (+t.slice(8) >= 3) await step('khóa kỳ công', async () => {
     const open = await q("SELECT p.id, l.short FROM hr_att_period p JOIN hr_legal l ON l.id = p.legal_id WHERE p.month = $1 AND p.status = 'mo'", [pm]); if (!open.length) return;
     await once('nhac_khoa_cong', pm, async () => { const us = (await q("SELECT id FROM hr_user WHERE active AND role = 'tp_hcns'")).map(u => u.id); await C.notify(dbx, us, `Kỳ công ${pm.slice(5)}/${pm.slice(0, 4)} chưa khóa`, open.map(x => x.short).join(', ') + ' — rà soát rồi khóa để lập bảng lương', 'e/att_period'); return `${open.length} pháp nhân`; });

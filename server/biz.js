@@ -114,6 +114,46 @@ async function onboard(ctx, emp, start) {
   return t.row.code;
 }
 
+// ---------- bảng trích nộp BH / CĐ: HCNS kiểm tra (ngày 20) → trình → giám đốc pháp nhân duyệt → kế toán pháp nhân nộp tiền, «Xác nhận đã nộp» ----------
+// giám đốc / kế toán lấy theo Danh mục pháp nhân (director_id, accountant_id = hồ sơ NV có tài khoản app); chưa khai → duyệt theo vai trò như cũ, báo mọi kế toán
+async function legalPeople(db, legalId) {
+  const l = legalId && await db.one('SELECT short, director_id, accountant_id FROM hr_legal WHERE id = $1', [legalId]); if (!l) return {};
+  const uid = async e => e ? (await db.one('SELECT id FROM hr_user WHERE emp_id = $1 AND active ORDER BY id LIMIT 1', [e]))?.id || null : null;
+  return { short: l.short, dir: await uid(l.director_id), acc: await uid(l.accountant_id) };
+}
+const SHEET_NAME = { ins_sheet: 'bảo hiểm', cd_sheet: 'công đoàn' }, mmyy = m => `${String(m).slice(5)}/${String(m).slice(0, 4)}`, vnd = v => `${Math.round(+v || 0).toLocaleString('vi-VN')} đ`;
+const sheetAmount = (ent, r) => ent === 'ins_sheet' ? (r.total_due ?? r.due) : r.due;
+const SHEET_FLOW = ent => ({
+  async approver(r, db) { return (await legalPeople(db, r.legal_id)).dir; },
+  async sees(r, u, db) { const p = await legalPeople(db, r.legal_id); return !!u && (u.id === p.dir || u.id === p.acc); },
+  async canAct(name, r, u, db) { return name === 'chot' && u.id === (await legalPeople(db, r.legal_id)).acc; },
+  async perms(r, u, db) { return r.status === 'da_duyet' && u.id === (await legalPeople(db, r.legal_id)).acc ? { extraActs: ['chot'] } : {}; },
+  async afterApprove(r, ok, ctx) {   // duyệt xong → kế toán pháp nhân nộp tiền (chưa khai kế toán → mọi tài khoản kế toán)
+    if (!ok) return; const p = await legalPeople(ctx.db, r.legal_id);
+    const to = p.acc ? [p.acc] : (await ctx.db.q("SELECT id FROM hr_user WHERE active AND role = 'ke_toan'")).map(x => x.id);
+    if (to.length) await C.notify(ctx.db, to, `Nộp ${SHEET_NAME[ent]} tháng ${mmyy(r.month)} — ${p.short || ''}`, `Đã duyệt · phải nộp ${vnd(sheetAmount(ent, r))} — nộp xong bấm «Xác nhận đã nộp»`, `e/${ent}/${r.id}`);
+    else ctx.warn.push('Chưa có tài khoản kế toán — khai «Kế toán thanh toán trên app» trong Danh mục pháp nhân');
+  },
+});
+const sheetPaid = ent => async (r, d, ctx) => {   // kế toán / HCNS xác nhận đã nộp: số tiền (trống = đủ), ngày, chứng từ → «Đã chuyển / đã nộp», báo người trình
+  const paid = d.paid != null && d.paid !== '' ? +d.paid : (r.paid ?? sheetAmount(ent, r));
+  const patch = { status: 'da_chuyen', paid }; if (ent === 'ins_sheet' && d.paid_doc) patch.paid_doc = d.paid_doc;
+  const by = (await ctx.db.one("SELECT requested_by FROM hr_approval WHERE ent = $1 AND rec_id = $2 ORDER BY id DESC LIMIT 1", [ent, r.id]))?.requested_by;
+  const p = await legalPeople(ctx.db, r.legal_id);
+  await C.notify(ctx.db, [by, r.created_by].filter(x => x && x !== ctx.user?.id), `Đã nộp ${SHEET_NAME[ent]} tháng ${mmyy(r.month)} — ${p.short || ''}`, `${vnd(paid)}${d.paid_on ? ' · ngày ' + C.dmy(d.paid_on) : ''}${d.paid_doc ? ' · ' + d.paid_doc : ''} · ${ctx.user?.full_name || ''}`, `e/${ent}/${r.id}`);
+  return { patch, note: `Đã nộp ${vnd(paid)}${d.paid_on ? ' ngày ' + C.dmy(d.paid_on) : ''}${d.paid_doc ? ' · ' + d.paid_doc : ''}` };
+};
+// ngày 20: tính lại bảng nháp tháng theo dữ liệu mới nhất, báo NV HCNS phụ trách pháp nhân kiểm tra rồi trình
+async function sheetReview(db, m) {
+  let n = 0;
+  for (const ent of ['ins_sheet', 'cd_sheet']) for (const r of await db.q(`SELECT * FROM hr_${ent} WHERE month = $1 AND status IN ('nhap', 'tu_choi')`, [m])) {
+    try { await (ent === 'ins_sheet' ? calcIns : calcCd)(db, r); } catch (e) { console.error('Tính lại bảng', ent, r.id, e.message); }
+    const x = await db.one(`SELECT t.*, l.short FROM hr_${ent} t JOIN hr_legal l ON l.id = t.legal_id WHERE t.id = $1`, [r.id]);
+    const us = (await C.approversOf(db, C.E[ent], x, { roles: ['cv_hcns', 'tp_hcns'] })).map(u => u.id);
+    if (us.length) { await C.notify(db, us, `Kiểm tra bảng trích nộp ${SHEET_NAME[ent]} tháng ${mmyy(m)} — ${x.short}`, `${x.n_emp || 0} NLĐ · phải nộp ${vnd(sheetAmount(ent, x))} — kiểm tra, chỉnh sửa rồi bấm «Trình duyệt» gửi giám đốc pháp nhân`, `e/${ent}/${x.id}`); n++; }
+  }
+  return n;
+}
 const H = {
   employee: {
     acts: { async to_trinh_tv(r, d, ctx) {   // NV thử việc: lập tờ trình tiếp nhận chính thức (đã có tờ trình chưa bị từ chối → mở lại)
@@ -366,8 +406,19 @@ const H = {
     async beforeSave(r, o, ctx) {   // kế hoạch có thể vượt định biên (sếp yêu cầu) → nhắc cập nhật định biên
       const ch = (r.channels || []).filter(x => x.channel); if (ch.length) { r.cost = ch.reduce((s, x) => s + n(x.budget), 0); r.channel = [...new Set([...String(r.channel || '').split(',').map(x => x.trim()).filter(Boolean), ...ch.map(x => x.channel)])].join(', '); }   // kênh đã chọn + kênh có ngân sách
     const h = await ctx.db.one("SELECT coalesce(sum(qty),0) n FROM hr_headcount WHERE dept_id = $1", [r.dept_id]), cur = await ctx.db.one("SELECT count(*) n FROM hr_employee WHERE dept_id = $1 AND state <> 'da_nghi'", [r.dept_id]);
-    if (+h.n && +cur.n + (+r.qty || 0) > +h.n) ctx.warn.push(`Tuyển ${r.qty} người sẽ vượt định biên bộ phận (${cur.n}/${h.n}) — cần cập nhật định biên CCTC05`);
-  } },
+    if (+h.n && +cur.n + (+r.qty || 0) > +h.n && r.rec_state !== 'de_xuat') ctx.warn.push(`Tuyển ${r.qty} người sẽ vượt định biên bộ phận (${cur.n}/${h.n}) — cần cập nhật định biên CCTC05`);
+  },
+    acts: {   // kế hoạch tự đề xuất (ngày 25) → TP HCNS / BGĐ duyệt → mở tuyển + tự soạn tin, lịch đăng
+      async duyet_kh(r, d, ctx) {
+        if (!['de_xuat', 'chua_mo', 'hoan'].includes(r.rec_state)) bad('Kế hoạch đang tuyển / đã tuyển — không cần duyệt lại');
+        const c = r.post_text ? {} : await require('./recauto').campaign(ctx.db, r);
+        const to = (await C.approversOf(ctx.db, C.E.rec_plan, r, { roles: ['cv_hcns'] })).map(u => u.id).filter(u => u !== ctx.user?.id);
+        await C.notify(ctx.db, to, `Đã duyệt kế hoạch tuyển: ${r.position} (${r.qty} người)`, 'Tin tuyển dụng và lịch đăng đã soạn sẵn — đến ngày đăng app sẽ nhắc', `e/rec_plan/${r.id}`);
+        return { patch: { rec_state: 'dang_tuyen', ...c }, note: `Duyệt kế hoạch${c.posts ? ` · đã soạn tin + lịch đăng ${c.posts.length} lượt` : ''}` };
+      },
+      async tu_choi_kh(r, d) { return { patch: { rec_state: 'hoan', auto_note: [r.auto_note, `Không duyệt (${C.dmy(today())}): ${d.reason}`].filter(Boolean).join('\n') }, note: d.reason }; },
+      async soan_tin(r, d, ctx) { const c = await require('./recauto').campaign(ctx.db, r); return { patch: c, note: `Đã soạn lại tin + lịch đăng ${c.posts.length} lượt` }; },
+    } },
   candidate: {
     // đã nhận việc: tình trạng khóa hội nhập của nhân viên tạo từ ứng viên (hoàn thành → rời cột «Đã nhận việc» trên bảng tuyển dụng)
     async decorate(rows, { db }) {
@@ -382,6 +433,7 @@ const H = {
     async beforeSave(r, o, ctx) {   // gắn với kế hoạch tuyển dụng → đơn vị, bộ phận, vị trí lấy theo kế hoạch
       if (!r.plan_id) return; const p = await ctx.db.one('SELECT legal_id, dept_id, position FROM hr_rec_plan WHERE id = $1', [r.plan_id]); if (!p) return;
       r.legal_id ??= p.legal_id; r.dept_id ??= p.dept_id; r.position ??= p.position;
+      if (!o) { await require('./recauto').screenNew(ctx.db, r); if (r.status === 'S11') ctx.warn.push(`Sàng lọc tự động: ${r.screen_score}/100 — chưa đạt, chuyển «Hồ sơ không đạt» (xem «Kết quả sàng lọc», sửa trạng thái nếu muốn giữ)`); }   // CV mới gắn kế hoạch → tự chấm điểm
     },
     // chuyển «Đã nhận việc» bằng cách sửa trạng thái / kéo thẻ → tự lập hồ sơ NV + HĐ thử việc (đã lập rồi thì thôi)
     async afterSave(r, old, ctx) { if (r.status === 'S60' && old?.status !== 'S60') { const x = await hire(ctx, r, {}); if (x.made) ctx.warn.push(`Đã tạo hồ sơ ${x.code} và HĐ thử việc — mở mục Hợp đồng lao động để in`); } },
@@ -484,7 +536,7 @@ const H = {
     },
     async afterApprove(r, ok, ctx) {
       if (!ok) return; const db = ctx.db;
-      if (r.kind !== 'het_tv') return db.q("UPDATE hr_candidate SET status = 'S53', start_on = coalesce($2, start_on) WHERE id = $1 AND status NOT IN ('S60')", [r.cand_id, r.start_on]);   // → «Chờ nhận việc»
+      if (r.kind !== 'het_tv') { await db.q("UPDATE hr_candidate SET status = 'S53', start_on = coalesce($2, start_on) WHERE id = $1 AND status NOT IN ('S60')", [r.cand_id, r.start_on]); return require('./recauto').afterMemo(ctx, r); }   // → «Chờ nhận việc» + lương thỏa thuận, checklist, báo gửi thư mời nhận việc
       // hết thử việc được duyệt → lập sẵn HĐLĐ xác định thời hạn 12 tháng từ ngày tiếp nhận (đến ngày đó việc nền tự thay HĐ thử việc, hồ sơ «Đang làm»)
       const from = r.start_on || today(), had = await db.one("SELECT id FROM hr_contract WHERE emp_id = $1 AND kind IN ('HD02','HD03') AND from_on >= $2 ORDER BY from_on LIMIT 1", [r.emp_id, from]);
       let id = had?.id;
@@ -512,6 +564,7 @@ const H = {
       if ((r.lines || []).length && r.lines.every(l => !l.code || l.result) && r.status === 'moi') r.status = 'da_pv';
     },
     async afterSave(r, old, ctx) {
+      if (r.status === 'de_xuat') return;   // lịch tự đề xuất: chưa đặt phòng, chưa báo trưởng BP / ứng viên cho tới khi HCNS «Chốt lịch»
       const go = () => autoLetters(r.id, ctx.user);   // tự gửi thư mời / thư kết quả lên app sau khi đã lưu xong (sau COMMIT)
       if (ctx.db.after) ctx.db.after.push(go); else await go();
       const db = ctx.db, cand = (r.lines || []).filter(l => l.code), RS = { 'Đạt': 'S35', 'Không đạt': 'S24', 'Vắng': 'S21' };
@@ -538,12 +591,21 @@ const H = {
       }
       // thông báo trưởng bộ phận: lịch mới / đổi giờ → xác nhận; có kết quả → báo kết quả
       const head = r.dept_id && await db.one('SELECT u.id FROM hr_dept d JOIN hr_user u ON u.emp_id = d.head_id AND u.active WHERE d.id = $1', [r.dept_id]), who = cand.map(l => l.name).filter(Boolean).join(', '), when = C.dmy(r.day) + (r.start_at ? ' ' + new Date(new Date(r.start_at).getTime() + 7 * 3600e3).toISOString().slice(11, 16) : '');
-      if (!head && r.dept_id && (!old || r.confirm === 'cho_xn' && old.confirm !== 'cho_xn')) ctx.warn.push('Bộ phận chưa có trưởng BP có tài khoản app — chưa gửi được thông báo xác nhận');
-      if (head && (!old || r.confirm === 'cho_xn' && old.confirm !== 'cho_xn')) await C.notify(db, [head.id], `Lịch phỏng vấn ${r.code} — cần xác nhận`, `${who} · ${when}${r.link ? ' · ' + r.link : ''}`, `e/interview/${r.id}`);
+      const fresh = !old || old.status === 'de_xuat';   // lịch mới / vừa chốt từ đề xuất
+      if (!head && r.dept_id && (fresh || r.confirm === 'cho_xn' && old.confirm !== 'cho_xn')) ctx.warn.push('Bộ phận chưa có trưởng BP có tài khoản app — chưa gửi được thông báo xác nhận');
+      if (head && (fresh || r.confirm === 'cho_xn' && old.confirm !== 'cho_xn')) await C.notify(db, [head.id], `Lịch phỏng vấn ${r.code} — cần xác nhận`, `${who} · ${when}${r.link ? ' · ' + r.link : ''}`, `e/interview/${r.id}`);
       const done = cand.filter(l => l.result && !(old?.lines || []).some(x => x.code === l.code && x.result === l.result));
       if (done.length) await C.notify(db, [head?.id, r.created_by].filter(id => id && id !== ctx.user?.id), `Kết quả phỏng vấn ${r.code}`, done.map(l => `${l.name || l.code}: ${l.result}`).join(' · '), `e/interview/${r.id}`);
+      const pass = done.filter(l => l.result === 'Đạt').map(l => l.code);   // đạt → tự lập tờ trình tiếp nhận (nháp), báo CV HCNS bổ sung lương rồi trình
+      if (pass.length) await require('./recauto').afterPass(ctx, pass);
     },
     acts: {
+      async chot_lich(r, d, ctx) {   // lịch tự đề xuất → HCNS chốt: chạy như lịch mới (đặt phòng, báo trưởng BP xác nhận, thư mời ứng viên)
+        if (!(r.lines || []).some(l => l.code)) bad('Lịch chưa có ứng viên');
+        const x = await C.update('interview', r.id, { status: 'moi', confirm: 'cho_xn' }, ctx.user, { db: ctx.db });
+        for (const w of x.warnings || []) ctx.warn.push(w);
+        return { note: 'Đã chốt lịch — đã báo trưởng bộ phận xác nhận, gửi thư mời ứng viên' };
+      },
       async gui_tbp(r, d, ctx) {   // trưởng BP chưa nhận / chưa xem → gửi lại thông báo xác nhận lịch
         const head = r.dept_id && await ctx.db.one('SELECT u.id, u.full_name FROM hr_dept d JOIN hr_user u ON u.emp_id = d.head_id AND u.active WHERE d.id = $1', [r.dept_id]);
         if (!head) bad('Bộ phận chưa có trưởng BP có tài khoản app — gán «Người phụ trách» ở Danh mục bộ phận');
@@ -657,8 +719,8 @@ const H = {
       for (const x of us) { const l = r.lines.find(y => y.emp_id === x.emp_id); await C.notify(ctx.db, [x.id], `Phiếu lương tháng ${r.month.slice(5)}/${r.month.slice(0, 4)}`, `Thực lĩnh ${Math.round(+l?.net || 0).toLocaleString('vi-VN')} đ · ${(+l?.d100 || 0) + (+l?.d85 || 0)} công — bấm để xem, in phiếu lương`, 'v/portal'); }
     },
     acts: { async tao_lai(r, d, ctx) { await calcPayroll(ctx.db, r); }, async chot() { return { patch: { status: 'da_chuyen' } }; } } },
-  ins_sheet: { beforeSave(r) { r.total_due = insDueTotal(r); }, async afterSave(r, old, ctx) { if (!old && !(r.lines || []).length) await calcIns(ctx.db, r); }, acts: { async tao_lai(r, d, ctx) { await calcIns(ctx.db, r); }, async chot(r) { return { patch: { status: 'da_chuyen', paid: r.paid ?? r.total_due ?? r.due } }; } } },   // đã nộp = tổng phải nộp (kể cả lãi, truy thu)
-  cd_sheet: { async afterSave(r, old, ctx) { if (!old && !(r.lines || []).length) await calcCd(ctx.db, r); }, acts: { async tao_lai(r, d, ctx) { await calcCd(ctx.db, r); }, async chot(r) { return { patch: { status: 'da_chuyen', paid: r.paid ?? r.due } }; } } },
+  ins_sheet: { ...SHEET_FLOW('ins_sheet'), beforeSave(r) { r.total_due = insDueTotal(r); }, async afterSave(r, old, ctx) { if (!old && !(r.lines || []).length) await calcIns(ctx.db, r); }, acts: { async tao_lai(r, d, ctx) { await calcIns(ctx.db, r); }, chot: sheetPaid('ins_sheet') } },   // đã nộp = tổng phải nộp (kể cả lãi, truy thu)
+  cd_sheet: { ...SHEET_FLOW('cd_sheet'), async afterSave(r, old, ctx) { if (!old && !(r.lines || []).length) await calcCd(ctx.db, r); }, acts: { async tao_lai(r, d, ctx) { await calcCd(ctx.db, r); }, chot: sheetPaid('cd_sheet') } },
 };
 C.hooks(H);
 for (const [k, v] of Object.entries({ employee: [{ k: 'to_trinh_tv', l: 'Tờ trình hết thử việc', ico: 'fa-file-signature', from: '*', roles: ['cv_hcns', 'tp_hcns'] }], candidate: [{ k: 'qua_vong', l: 'Qua vòng tiếp theo', ico: 'fa-circle-check', from: ['S12', 'S33', 'S34', 'S35', 'S36', 'S52'], roles: ['cv_hcns', 'tp_hcns'] },
@@ -673,7 +735,7 @@ async function autoLetters(id, user) {
   {
     try {
       const db = { q: (s, p) => require('./db').q(s, p), one: (s, p) => require('./db').one(s, p) };
-      const r = await db.one('SELECT * FROM hr_interview WHERE id = $1', [id]); if (!r || r.status === 'huy') return;
+      const r = await db.one('SELECT * FROM hr_interview WHERE id = $1', [id]); if (!r || r.status === 'huy' || r.status === 'de_xuat') return;
       const log = r.sent_log || {}, lines = (r.lines || []).filter(l => l.code), t = today();
       const inv = lines.filter(l => !l.result && r.day >= t && log[l.code]?.ik !== inviteKey(r, l)).map(l => l.code);
       const res = lines.filter(l => l.result && log[l.code]?.res !== l.result).map(l => l.code);
@@ -977,4 +1039,4 @@ async function mealCopy(u, m, lg = null, from = null) {   // from: chỉ chép c
   }
   return out;
 }
-module.exports = { mealCopy, H, n, lastDay, nextMonth, prevMonth, monthAtt, vppStock, setMark, assertOpen, calcPayroll, calcIns, calcCd, insStaff, officialDays, editPayLine, insTotals, cdTotals, insRow, cdRow, insDueTotal, payLine, PAY_EDIT, taxOf, leaveUsed, leaveLeft, leaveEarned, syncLeave, autoLeaveList, autoLeaveMake, cultureOn, cultureFits, cultureRoster, isWorkday, holidays, hoursBetween, applyDue };
+module.exports = { mealCopy, H, sheetReview, hire, onboard, n, lastDay, nextMonth, prevMonth, monthAtt, vppStock, setMark, assertOpen, calcPayroll, calcIns, calcCd, insStaff, officialDays, editPayLine, insTotals, cdTotals, insRow, cdRow, insDueTotal, payLine, PAY_EDIT, taxOf, leaveUsed, leaveLeft, leaveEarned, syncLeave, autoLeaveList, autoLeaveMake, cultureOn, cultureFits, cultureRoster, isWorkday, holidays, hoursBetween, applyDue };

@@ -47,7 +47,10 @@ function shell() {
       const ml = /Tiền ăn tháng (\d{2})\/(\d{4})/.exec(a.textContent);   // thông báo tiền ăn → mở hộp QR + số tiền + «Đã thanh toán» ngay giữa màn hình
       if (ml) { ev.preventDefault(); if (location.hash !== '#/v/portal') location.hash = '#/v/portal'; return openMealBill(`${ml[2]}-${ml[1]}`); }
       const en = /^#\/e\/([a-z_]+)/.exec(a.getAttribute('href') || '');   // thông báo trỏ tới màn người nhận không có quyền xem (vd. NLĐ – quản lý đào tạo) → về trang cá nhân
-      if (en && !M.ents[en[1]]?.perm?.r) { ev.preventDefault(); const tid = en[1] === 'training' && /\/(\d+)$/.exec(a.getAttribute('href'))?.[1]; location.hash = tid ? `#/v/portal/trn${tid}` : '#/v/portal'; return; }
+      if (en && !M.ents[en[1]]?.perm?.r) { ev.preventDefault(); const rid = /\/(\d+)$/.exec(a.getAttribute('href'))?.[1];
+        if (en[1] === 'training') { location.hash = rid ? `#/v/portal/trn${rid}` : '#/v/portal'; return; }
+        // người được chỉ định trên phiếu (vd. giám đốc / kế toán pháp nhân duyệt, nộp BH) → mở thẳng phiếu; không xem được thì về trang cá nhân
+        if (rid) { try { await openDetail(en[1], +rid); return; } catch { } } location.hash = '#/v/portal'; return; }
       if (a.getAttribute('href') === location.hash || (a.getAttribute('href') === '#/' && location.hash === '#/' + M.home)) { ev.preventDefault(); return route(); }   // trỏ về đúng trang đang mở → vẫn mở lại
     }));
     if ($('#nra', p)) $('#nra', p).onclick = run(async e2 => { e2.stopPropagation(); await api('POST', '/api/notices/read', {}); p.remove(); badge(); });

@@ -20,7 +20,7 @@ let bellAlerts = 0;
 const menuHas = it => M.menu.some(([, xs]) => xs.some(([, , x]) => Array.isArray(x) ? x.some(y => y[0] === it) : x === it));
 const badge = () => api('GET', '/api/notices').then(n => { const d = $('#bd'); if (!d) return; d.textContent = n.unread; d.classList.toggle('hidden', !n.unread); }).catch(() => { });
 function shell() {
-  const me = M.me, initials = me.full_name.split(' ').slice(-2).map(s => s[0]).join('');
+  const me = M.me, initials = me.full_name.split(' ').filter(s => /^\p{L}/u.test(s)).slice(-2).map(s => s[0]).join('');
   const nav = M.menu.map(([g, items]) => `<h6>${g}</h6>` + items.map(([l, ic, x], i) => {
     if (Array.isArray(x) && ['e:ins_sheet', 'e:cd_sheet'].includes(x[0]?.[0])) x = x[0][0];   // BH, CĐ: một lối vào; tổng hợp năm mở bằng nút trong danh sách
     if (!Array.isArray(x)) return `<a href="#/${x.replace(':', '/')}" data-r="${x.replace(':', '/')}">${ico(ic)}${esc(l)}</a>`;
@@ -47,7 +47,10 @@ function shell() {
       const ml = /Tiền ăn tháng (\d{2})\/(\d{4})/.exec(a.textContent);   // thông báo tiền ăn → mở hộp QR + số tiền + «Đã thanh toán» ngay giữa màn hình
       if (ml) { ev.preventDefault(); if (location.hash !== '#/v/portal') location.hash = '#/v/portal'; return openMealBill(`${ml[2]}-${ml[1]}`); }
       const en = /^#\/e\/([a-z_]+)/.exec(a.getAttribute('href') || '');   // thông báo trỏ tới màn người nhận không có quyền xem (vd. NLĐ – quản lý đào tạo) → về trang cá nhân
-      if (en && !M.ents[en[1]]?.perm?.r) { ev.preventDefault(); const tid = en[1] === 'training' && /\/(\d+)$/.exec(a.getAttribute('href'))?.[1]; location.hash = tid ? `#/v/portal/trn${tid}` : '#/v/portal'; return; }
+      if (en && !M.ents[en[1]]?.perm?.r) { ev.preventDefault(); const rid = /\/(\d+)$/.exec(a.getAttribute('href'))?.[1];
+        if (en[1] === 'training') { location.hash = rid ? `#/v/portal/trn${rid}` : '#/v/portal'; return; }
+        // người được chỉ định trên phiếu (vd. giám đốc / kế toán pháp nhân duyệt, nộp BH) → mở thẳng phiếu; không xem được thì về trang cá nhân
+        if (rid) { try { await openDetail(en[1], +rid); return; } catch { } } location.hash = '#/v/portal'; return; }
       if (a.getAttribute('href') === location.hash || (a.getAttribute('href') === '#/' && location.hash === '#/' + M.home)) { ev.preventDefault(); return route(); }   // trỏ về đúng trang đang mở → vẫn mở lại
     }));
     if ($('#nra', p)) $('#nra', p).onclick = run(async e2 => { e2.stopPropagation(); await api('POST', '/api/notices/read', {}); p.remove(); badge(); });
@@ -486,7 +489,7 @@ async function openMealBill(month) {
 // ---------- Chấm công & đơn từ (nhân viên) — bản thử của mục sẽ cắm vào app các phòng; #/v/portal?embed=1 = không có khung app ----------
 async function portalScreen() {
   const d = await api('GET', '/api/portal'), E = d.emp, T = d.today, mo = d.month, C2 = d.catalog, pend = d.reqs.filter(r => r.status === 'cho_duyet').length;
-  const hm = () => new Date(Date.now() + 7 * 3600e3).toISOString().slice(11, 19), init = E.name.split(' ').slice(-2).map(s => s[0]).join('');
+  const hm = () => new Date(Date.now() + 7 * 3600e3).toISOString().slice(11, 19), init = E.name.split(' ').filter(s => /^\p{L}/u.test(s)).slice(-2).map(s => s[0]).join('');
   const DN = ['CN', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7'], m = mo.month, md = new Map(mo.days.map(x => [+x.day.slice(8), x.mark]));
   // lịch công tháng: 7 cột T2 → CN như lịch thường; ô chỉ có số ngày + ký hiệu công; ngày làm việc đã qua mà chưa có công → chữ «thiếu» đỏ nhạt; hôm nay viền xanh
   const lead = (new Date(m + '-01T00:00:00Z').getUTCDay() + 6) % 7, cal = ['T2', 'T3', 'T4', 'T5', 'T6', 'T7', 'CN'].map(x => `<i class="${x === 'CN' ? 'cn' : ''}">${x}</i>`).join('') + '<span></span>'.repeat(lead) + Array.from({ length: mo.last }, (_, i) => { const dd = `${m}-${String(i + 1).padStart(2, '0')}`, dow = new Date(dd + 'T00:00:00Z').getUTCDay(), mk = md.get(i + 1), off = dow === 0 || mo.hol.includes(dd), kc = !mk && !off && dd < T.day; return `<div class="${off ? 'off' : ''} ${dd === T.day ? 'td' : ''} ${dd > T.day ? 'fu' : ''} ${mk ? (mkCls(mk) === 'X' ? 'warn' : 'ok') : kc ? 'kc' : ''}" title="${dmy(dd)}${mk ? ' · ' + esc(mk) : kc ? ' · chưa có công — chấm bù hoặc làm đơn nếu có đi làm / nghỉ có phép' : ''}"><b>${i + 1}</b>${mk ? `<span class="mk ${mkCls(mk)}">${esc(mk)}</span>` : kc ? '<em>chưa có</em>' : ''}</div>`; }).join(''), nKc = Array.from({ length: mo.last }, (_, i) => `${m}-${String(i + 1).padStart(2, '0')}`).filter(dd => !md.get(+dd.slice(8)) && new Date(dd + 'T00:00:00Z').getUTCDay() !== 0 && !mo.hol.includes(dd) && dd < T.day).length;
